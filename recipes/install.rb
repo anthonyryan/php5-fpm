@@ -17,7 +17,7 @@
 ### - Configure REPOs for Earlier Releases
 
 #Configure REPO for Debian 6.x
-if node[:platform].include?("debian") && node[:platform_version].include?("6.") && node["php_fpm"]["use_cookbook_repos"]
+if node[:platform].include?("debian") && node[:platform_version].include?("6.") && node["php_fpm"]["use_cookbook_repos"] && node["php_fpm"]["install_method"].include?("package")
 
     #Install php5-fpm repo Debian 6.x
     cookbook_file "/etc/apt/sources.list.d/dotdeb.list" do
@@ -32,7 +32,7 @@ if node[:platform].include?("debian") && node[:platform_version].include?("6.") 
         action :run
     end
 
-elsif node[:platform].include?("centos") && node[:platform_version].include?("6.") && node["php_fpm"]["use_cookbook_repos"]
+elsif node[:platform].include?("centos") && node[:platform_version].include?("6.") && node["php_fpm"]["use_cookbook_repos"] && node["php_fpm"]["install_method"].include?("package")
 
     #Install RPMForge Key CentOS 6.x
     bash "Add RPMForge Key CentOS 6.x" do
@@ -52,7 +52,7 @@ elsif node[:platform].include?("centos") && node[:platform_version].include?("6.
         action :remove
     end
 
-elsif node[:platform].include?("ubuntu") && node[:platform_version].include?("10.04") && node["php_fpm"]["use_cookbook_repos"]
+elsif node[:platform].include?("ubuntu") && node[:platform_version].include?("10.04") && node["php_fpm"]["use_cookbook_repos"] && node["php_fpm"]["install_method"].include?("package")
 
     #Install Python Software Props Ubuntu 10.04
     package "python-software-properties" do
@@ -79,41 +79,108 @@ elsif node[:platform].include?("ubuntu") && node[:platform_version].include?("10
         recursive true
     end
 
-end
-
-
-
-
-
-### - Update Host If Enabled
-
-#Run our update if stated **hostupgrade will only run on first-run by default
-if node["php_fpm"]["run_update"]
-
-    #Run our host update and upgrade
-    include_recipe 'hostupgrade::upgrade'
-
-end
-
-
-
-
-### - Install PHP Modules and PHP-FPM Package
-
-#Install PHP Modules if Enabled
-node["php_fpm"]["php_modules"].each do |install_packages|
-    package install_packages do
-        action :install
-        only_if { node["php_fpm"]["install_php_modules"] }
+    bash 'update_package_list' do
+      code <<-EOH
+       sudo apt-get update
+        EOH
     end
+
 end
 
-#Install PHP-FPM Package - Don't install if CentOS, it will be installed above as part of the module listing.
-package node["php_fpm"]["package"] do
-    action :install
+
+
+
+### - Install PHP Modules and PHP-FPM 
+
+
+
+
+if node["php_fpm"]["install_method"].include?("source")
+
+#Install source
+
+  #Install dependencies in package form
+  node["php_fpm"]["php_dependencies"].each do |install_packages|
+      package install_packages do
+          action :install
+          only_if { node["php_fpm"]["install_php_dependencies"] }
+          not_if "#{node["php_fpm"]["package_query"]} #{install_packages}"
+      end
+  end
+
+  #Create some directories
+  %w{#{node["php_fpm"]["base_path"]}/conf.d #{node["php_fpm"]["base_path"]}/cli/conf.d #{node["php_fpm"]["base_path"]}/fpm/conf.d #{node["php_fpm"]["base_path"]}/fpm/pool.d /usr/local/#{node["php_fpm"]["php_prefix"]} /usr/local/src/#{node["php_fpm"]["php_prefix"]}}.each do |dir|
+    directory "#{dir}" do
+      mode "0755"
+      owner "root"
+      group "root"
+      action :create
+      recursive true
+      not_if { ::Dir.exists?("#{dir}") }
+    end
+  end
+
+  #Decide if we want to use git or extract
+  src_file_url=node["php_fpm"]["source"]["url"]
+  src_build_path="/usr/local/src/#{node["php_fpm"]["php_prefix"]}"
+  if src_file_url.include?('tarball')
+    remote_file "fetch_php_source" do
+      source src_file_url
+      path src_build_path
+      backup false
+      only_if { ::Dir.exists?(src_build_path) }
+    end
+
+    execute "tar --no-same-owner -zxvf php*" do
+      cwd src_build_path
+    end
+  else
+    git "git_php_source" do
+      destination src_build_path
+      repository src_file_url
+      action :sync
+      depth 1
+      branch "#{node["php_fpm"]["source"]["branch"]}"
+      checkout_branch "#{node["php_fpm"]["source"]["branch"]}"
+      only_if { ::Dir.exists?(src_build_path) }
+    end
+  end
+
+  #Buid from source
+  bash "build_php_source" do
+    cwd src_build_path
+    user "root"
+    group "root"
+    code <<-EOH
+     ./buildconf --force && 
+     ./configure #{node['php_fpm']['source']['common-conf-string'].join(" ")} #{node['php_fpm']['source']['fpm-conf-string'].join(" ")} &&
+#     make && make install &&
+#     ./configure #{node['php_fpm']['source']['common-conf-string'].join(" ")} #{node['php_fpm']['source']['cli-conf-string'].join(" ")} &&
+     make && make install
+   EOH
+   only_if { ::Dir.exists?(src_build_path) }
+  end
+
+else
+
+  #Install PHP Modules if Enabled
+  node["php_fpm"]["php_modules"].each do |install_packages|
+      package install_packages do
+          action :install
+          only_if { node["php_fpm"]["install_php_modules"] }
+          not_if "#{node["php_fpm"]["package_query"]} #{install_packages}"
+      end
+  end
+
+  #Install PHP-FPM Package - Don't install if CentOS, it will be installed above as part of the module listing.
+  package node["php_fpm"]["package"] do
+      action :install
+      not_if "#{node["php_fpm"]["package_query"]} #{package}"
+  end
+
 end
 
-#Enable and Restart PHP5-FPM
+#Enable and Restart PHP-FPM
 service node["php_fpm"]["package"] do
     #Bug in 14.04 for service provider. Adding until resolved.
     if (platform?('ubuntu') && node['platform_version'].to_f == 14.04)
